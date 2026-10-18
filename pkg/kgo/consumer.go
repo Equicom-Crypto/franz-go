@@ -689,6 +689,48 @@ func (cl *Client) SetOffsets(setOffsets map[string]map[int32]EpochOffset) {
 	cl.setOffsets(setOffsets, true)
 }
 
+// addUninstalledEqualDirty adds each equal-dirty partition to assigns when its
+// cursor is not installed at the requested offset: the cursor is not in
+// usingCursors, or a list or epoch load for the partition is pending in the
+// current session. Only an installed, load-free partition stays a no-op. Called
+// under c.mu; the session lock is taken after it, as in assignPartitions.
+func (c *consumer) addUninstalledEqualDirty(assigns, equalDirty map[string]map[int32]Offset, tps *topicsPartitions) map[string]map[int32]Offset {
+	if len(equalDirty) == 0 || tps == nil {
+		return assigns
+	}
+	session := c.loadSession()
+	var pending listOrEpochLoads
+	if session != noConsumerSession {
+		session.listOrEpochMu.Lock()
+		pending = pendingLoadSnapshot(session.listOrEpochLoadsWaiting, session.listOrEpochLoadsLoading)
+		session.listOrEpochMu.Unlock()
+	}
+	topics := tps.load()
+	for topic, partitions := range equalDirty {
+		topicPartitions := topics.loadTopic(topic)
+		if topicPartitions == nil {
+			continue
+		}
+		for partition, offset := range partitions {
+			installed := false
+			if partition >= 0 && partition < int32(len(topicPartitions.partitions)) {
+				_, installed = c.usingCursors[topicPartitions.partitions[partition].cursor]
+			}
+			if installed && !pending.hasLoad(topic, partition) {
+				continue
+			}
+			if assigns == nil {
+				assigns = make(map[string]map[int32]Offset, 10)
+			}
+			if assigns[topic] == nil {
+				assigns[topic] = make(map[int32]Offset, len(partitions))
+			}
+			assigns[topic][partition] = offset
+		}
+	}
+	return assigns
+}
+
 func (cl *Client) setOffsets(setOffsets map[string]map[int32]EpochOffset, log bool) {
 	if len(setOffsets) == 0 {
 		return
@@ -702,15 +744,17 @@ func (cl *Client) setOffsets(setOffsets map[string]map[int32]EpochOffset, log bo
 	defer c.mu.Unlock()
 
 	var assigns map[string]map[int32]Offset
+	var equalDirty map[string]map[int32]Offset
 	var tps *topicsPartitions
 	switch {
 	case c.d != nil:
 		assigns = c.d.applySetOffsets(setOffsets)
 		tps = c.d.tps
 	case c.g != nil:
-		assigns = c.g.applySetOffsets(setOffsets)
+		assigns, equalDirty = c.g.applySetOffsets(setOffsets)
 		tps = c.g.tps
 	}
+	assigns = c.addUninstalledEqualDirty(assigns, equalDirty, tps)
 	if len(assigns) == 0 {
 		return
 	}
@@ -1098,10 +1142,13 @@ func (c *consumer) assignPartitions(assignments map[string]map[int32]Offset, how
 		case assignSetMatching:
 			// Loads for partitions that were being consumed were
 			// handled in the cursor walk above (offset set directly,
-			// pending load dropped). Anything remaining is a load for
-			// a partition that never finished loading; SetOffsets
-			// documents those are skipped, so we keep their loads
-			// untouched.
+			// pending load dropped). A partition whose initial load
+			// never finished still has its load here; that load would
+			// install its stale result over the requested offset, so
+			// it is replaced by the requested offset. Partitions with
+			// no pending load get nothing new: SetOffsets documents
+			// that partitions not already being consumed are skipped.
+			loadOffsets.replaceSetMatching(assignments)
 		case assignInvalidateMatching:
 			loadOffsets.keepFilter(func(t string, p int32) bool {
 				if assignTopic, ok := assignments[t]; ok {
@@ -1420,6 +1467,62 @@ func (l *listOrEpochLoads) addLoad(t string, p int32, loadType listOrEpochLoadTy
 		(*dst)[t] = ps
 	}
 	ps[p] = load
+}
+
+// replaceSetMatching swaps each pending load for a partition named in
+// assignments with the requested offset, normalized as the offset-loading
+// section of assignPartitions does. Partitions without a pending load are not
+// added to. The selection is snapshotted first, so replacing a load never
+// changes which partitions are visited.
+func (l *listOrEpochLoads) replaceSetMatching(assignments map[string]map[int32]Offset) {
+	type pendingKey struct {
+		t string
+		p int32
+	}
+	var selected []pendingKey
+	l.each(func(t string, p int32) {
+		if _, ok := assignments[t][p]; ok {
+			selected = append(selected, pendingKey{t, p})
+		}
+	})
+	for _, k := range selected {
+		offset := assignments[k.t][k.p]
+		if offset.afterMilli {
+			l.addLoad(k.t, k.p, loadTypeList, offsetLoad{replica: -1, Offset: offset})
+			continue
+		}
+		if offset.at >= 0 {
+			offset.at += offset.relative
+			if offset.at < 0 {
+				offset.at = 0
+			}
+			offset.relative = 0
+		}
+		if offset.at >= 0 && offset.epoch >= 0 {
+			l.addLoad(k.t, k.p, loadTypeEpoch, offsetLoad{replica: -1, Offset: offset})
+			continue
+		}
+		l.addLoad(k.t, k.p, loadTypeList, offsetLoad{replica: -1, Offset: offset})
+	}
+}
+
+// pendingLoadSnapshot returns a copy of the waiting and loading loads. The
+// result owns fresh maps: writing to it never touches the session's own loads.
+// The copy is taken under the session lock by the caller.
+func pendingLoadSnapshot(waiting, loading listOrEpochLoads) listOrEpochLoads {
+	var snap listOrEpochLoads
+	snap.mergeFrom(waiting)
+	snap.mergeFrom(loading)
+	return snap
+}
+
+// hasLoad reports whether a list or epoch load is pending for t and p.
+func (l listOrEpochLoads) hasLoad(t string, p int32) bool {
+	if _, ok := l.List[t][p]; ok {
+		return true
+	}
+	_, ok := l.Epoch[t][p]
+	return ok
 }
 
 func (l *listOrEpochLoads) removeLoad(t string, p int32) (removed bool) {

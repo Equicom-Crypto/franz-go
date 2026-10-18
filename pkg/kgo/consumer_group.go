@@ -2229,14 +2229,14 @@ func (g *groupConsumer) loopCommit() {
 // cursors. If all partitions already had the same dirty offset, this returns
 // nil and no cursor reassignment is needed - this is a key optimization for
 // transactions resetting state on abort.
-func (g *groupConsumer) applySetOffsets(setOffsets map[string]map[int32]EpochOffset) (assigns map[string]map[int32]Offset) {
+func (g *groupConsumer) applySetOffsets(setOffsets map[string]map[int32]EpochOffset) (assigns, equalDirty map[string]map[int32]Offset) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	groupTopics := g.tps.load()
 
 	if g.uncommitted == nil {
-		return nil
+		return nil, nil
 	}
 	for topic, partitions := range setOffsets {
 		if !groupTopics.hasTopic(topic) {
@@ -2257,7 +2257,21 @@ func (g *groupConsumer) applySetOffsets(setOffsets map[string]map[int32]EpochOff
 				head:      epochOffset,
 				committed: epochOffset,
 			}
+			// Equal bookkeeping is not proof that the cursor sits at
+			// this offset: a pending load for the partition would
+			// install its stale result. Hand the partition back so
+			// the caller decides whether it needs a reassign.
 			if current.dirty == epochOffset {
+				if equalDirty == nil {
+					equalDirty = make(map[string]map[int32]Offset, 10)
+				}
+				if equalDirty[topic] == nil {
+					equalDirty[topic] = make(map[int32]Offset, len(partitions))
+				}
+				equalDirty[topic][partition] = Offset{
+					at:    epochOffset.Offset,
+					epoch: epochOffset.Epoch,
+				}
 				continue
 			} else if topicAssigns == nil {
 				topicAssigns = make(map[int32]Offset, len(partitions))
@@ -2275,7 +2289,7 @@ func (g *groupConsumer) applySetOffsets(setOffsets map[string]map[int32]EpochOff
 		}
 	}
 
-	return assigns
+	return assigns, equalDirty
 }
 
 // UncommittedOffsets returns the latest uncommitted offsets. Uncommitted
