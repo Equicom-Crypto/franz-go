@@ -566,10 +566,10 @@ func TestIssue1505(t *testing.T) {
 			return errors.New("request did not return")
 		}
 	}
-	short := func() error {
+	short := func(req kmsg.Request) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
-		return wait(ctx, kmsg.NewPtrApiVersionsRequest())
+		return wait(ctx, req)
 	}
 
 	firstCtx, firstCancel := context.WithCancel(context.Background())
@@ -579,7 +579,7 @@ func TestIssue1505(t *testing.T) {
 	go func() { firstErr <- wait(firstCtx, first) }()
 	<-stalled
 
-	if err := short(); !errors.Is(err, context.DeadlineExceeded) {
+	if err := short(kmsg.NewPtrApiVersionsRequest()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("queued request error = %v, want %v", err, context.DeadlineExceeded)
 	}
 	firstCancel()
@@ -605,10 +605,30 @@ func TestIssue1505(t *testing.T) {
 	}
 
 	cxn.throttleUntil.Store(time.Now().Add(time.Hour).UnixNano())
-	if err := short(); !errors.Is(err, context.DeadlineExceeded) {
+	if err := short(kmsg.NewPtrApiVersionsRequest()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("throttled request error = %v, want %v", err, context.DeadlineExceeded)
 	}
 	if cxn.dead.Load() {
 		t.Error("a request canceled while waiting out a throttle killed the connection")
+	}
+
+	// On a connection whose reads watch only the response at the head of
+	// the ring (produce here), a request queued behind another returns at
+	// its deadline too, rather than when the earlier read ends. The first
+	// produce opens the connection and is never answered; the broker
+	// handles the second only after writing the first.
+	inflightCtx, inflightCancel := context.WithCancel(context.Background())
+	defer inflightCancel()
+	b.issue(inflightCtx, kmsg.NewPtrProduceRequest())
+	select {
+	case err := <-connected:
+		if err != nil {
+			t.Fatalf("produce connection initialization error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("produce connection did not finish initializing")
+	}
+	if err := short(kmsg.NewPtrProduceRequest()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued produce request error = %v, want %v", err, context.DeadlineExceeded)
 	}
 }

@@ -686,40 +686,54 @@ start:
 		noResp.Version = req.GetVersion()
 	}
 
-	corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(pr.ctx, pr.enqueue, req)
+	// Everything we read from req, before abandonOnCancel: once a cancel
+	// fails the request, the caller may reuse req.
+	key, version := req.Key(), req.GetVersion()
+	rt, wt := cxn.cl.connTimeouter.timeouts(req)
+	buf := cxn.cl.reqFormatter.AppendRequest(cxn.cl.bufPool.get()[:0], req, cxn.corrID)
+	var resp kmsg.Response
+	var flexibleHeader bool
+	if !isNoResp {
+		resp = req.ResponseKind()
+		flexibleHeader = req.IsFlexible() && key != 18 // response header not flexible if ApiVersions; see promisedResp doc
+	}
+
+	// From here on, a cancel fails the request as abandonOnCancel says.
+	// On cxnNormal the write is not interrupted, so it carries no ctx.
+	readCtx, promise, stop := cxn.abandonOnCancel(pr.ctx, pr.promise)
+	writeCtx := pr.ctx
+	if cxn.isNormalCxn {
+		writeCtx = nil
+	}
+	corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeBuf(writeCtx, pr.enqueue, key, version, wt, buf)
 
 	if writeErr != nil {
 		cxn.die()
-		cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
+		cxn.hookWriteE2E(key, bytesWritten, writeWait, timeToWrite, writeErr)
 		// If we wrote 0 bytes, the broker never saw the request.
 		// Safe to retry once on a new connection, same as the
-		// loadConnection retry above. Does not count against the
-		// client's retry budget.
-		if bytesWritten == 0 && !retriedOnNewConnection {
+		// loadConnection retry above, unless a cancel already failed
+		// the request: the caller may be reusing req. Does not count
+		// against the client's retry budget.
+		if bytesWritten == 0 && !retriedOnNewConnection && stop() {
 			retriedOnNewConnection = true
 			goto start
 		}
-		pr.promise(nil, writeErr)
+		promise(nil, writeErr)
 		return
 	}
 
 	if isNoResp {
-		pr.promise(noResp, nil)
-		cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
+		promise(noResp, nil)
+		cxn.hookWriteE2E(key, bytesWritten, writeWait, timeToWrite, writeErr)
 		return
 	}
 
-	rt, _ := cxn.cl.connTimeouter.timeouts(req)
-
-	ctx, promise := pr.ctx, pr.promise
-	if cxn.isNormalCxn {
-		ctx, promise = cxn.abandonOnCancel(ctx, promise)
-	}
 	cxn.waitResp(promisedResp{
-		ctx,
+		readCtx,
 		corrID,
-		req.IsFlexible() && req.Key() != 18, // response header not flexible if ApiVersions; see promisedResp doc
-		req.ResponseKind(),
+		flexibleHeader,
+		resp,
 		promise,
 		rt,
 		bytesWritten,
@@ -1520,24 +1534,26 @@ func maybeUpdateCtxErr(clientCtx, reqCtx context.Context, err *error) {
 // writeRequest writes a message request to the broker connection, bumping the
 // connection's correlation ID as appropriate for the next write.
 func (cxn *brokerCxn) writeRequest(ctx context.Context, enqueuedForWritingAt time.Time, req kmsg.Request) (corrID int32, bytesWritten int, writeWait, timeToWrite time.Duration, readEnqueue time.Time, writeErr error) {
-	buf := cxn.cl.reqFormatter.AppendRequest(
-		cxn.cl.bufPool.get()[:0],
-		req,
-		cxn.corrID,
-	)
-
+	buf := cxn.cl.reqFormatter.AppendRequest(cxn.cl.bufPool.get()[:0], req, cxn.corrID)
 	_, wt := cxn.cl.connTimeouter.timeouts(req)
+	return cxn.writeBuf(ctx, enqueuedForWritingAt, req.Key(), req.GetVersion(), wt, buf)
+}
+
+// writeBuf writes an appended request and returns buf to the pool. handleReq
+// appends the request itself, before a cancel can hand req back to its
+// caller (see abandonOnCancel).
+func (cxn *brokerCxn) writeBuf(ctx context.Context, enqueuedForWritingAt time.Time, key, version int16, wt time.Duration, buf []byte) (corrID int32, bytesWritten int, writeWait, timeToWrite time.Duration, readEnqueue time.Time, writeErr error) {
 	bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr = cxn.writeConn(ctx, buf, wt, enqueuedForWritingAt)
 
 	cxn.cl.bufPool.put(buf)
 
 	cxn.cl.cfg.hooks.each(func(h Hook) {
 		if h, ok := h.(HookBrokerWrite); ok {
-			h.OnBrokerWrite(cxn.b.meta, req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
+			h.OnBrokerWrite(cxn.b.meta, key, bytesWritten, writeWait, timeToWrite, writeErr)
 		}
 	})
 	if logger := cxn.cl.cfg.logger; logger.Level() >= LogLevelDebug {
-		logger.Log(LogLevelDebug, fmt.Sprintf("wrote %s v%d", kmsg.NameForKey(req.Key()), req.GetVersion()), "broker", logID(cxn.b.meta.NodeID), "bytes_written", bytesWritten, "write_wait", writeWait, "time_to_write", timeToWrite, "err", writeErr)
+		logger.Log(LogLevelDebug, fmt.Sprintf("wrote %s v%d", kmsg.NameForKey(key), version), "broker", logID(cxn.b.meta.NodeID), "bytes_written", bytesWritten, "write_wait", writeWait, "time_to_write", timeToWrite, "err", writeErr)
 	}
 
 	if writeErr != nil {
@@ -1808,15 +1824,31 @@ func (cxn *brokerCxn) die() {
 	cxn.failParked()
 }
 
-// On cxnNormal, a request canceled after it is written fails immediately and
-// its response is dropped when it arrives, rather than killing the
-// connection: Kafka handles the request regardless, and killing the
-// connection fails every request in flight on it. Other connections still
-// die on cancel: Kafka can hold their requests for a long time and handles
-// one request per connection at a time.
-func (cxn *brokerCxn) abandonOnCancel(ctx context.Context, promise func(kmsg.Response, error)) (context.Context, func(kmsg.Response, error)) {
+// On cxnNormal, a request canceled once it is being written fails immediately
+// and the connection is kept: the write finishes, and the response is
+// dropped when it arrives. Kafka handles the request regardless, and killing
+// the connection fails every request in flight on it. Other connections
+// still die on cancel: Kafka can hold their requests for a long time and
+// handles one request per connection at a time. On those, writeConn
+// interrupts the write and readConn watches the ctx of the response it is
+// reading, so a request at the head of the ring fails at its cancel already.
+// A request queued behind another fails here at its cancel, and its read
+// still kills the connection when its turn comes.
+//
+// This returns the ctx for the read to watch (nil on cxnNormal), the promise
+// to call, and stop, which ends the watch and reports whether the promise is
+// still ours to call: false once the cancel has failed the request.
+func (cxn *brokerCxn) abandonOnCancel(ctx context.Context, promise func(kmsg.Response, error)) (context.Context, func(kmsg.Response, error), func() bool) {
+	var readCtx context.Context
+	if !cxn.isNormalCxn {
+		readCtx = ctx
+	}
 	if ctx.Done() == nil || ctx == cxn.cl.ctx {
-		return ctx, promise
+		return readCtx, promise, func() bool { return true }
+	}
+	// Only we push to resps, so if it is empty, our response is next.
+	if !cxn.isNormalCxn && cxn.resps.empty() {
+		return readCtx, promise, func() bool { return true }
 	}
 	stop := context.AfterFunc(ctx, func() {
 		err := ctx.Err()
@@ -1825,11 +1857,11 @@ func (cxn *brokerCxn) abandonOnCancel(ctx context.Context, promise func(kmsg.Res
 		}
 		promise(nil, err)
 	})
-	return context.WithoutCancel(ctx), func(resp kmsg.Response, err error) {
+	return readCtx, func(resp kmsg.Response, err error) {
 		if stop() { // false: the cancel already failed the promise
 			promise(resp, err)
 		}
-	}
+	}, stop
 }
 
 // waitResp, called serially by a broker's handleReqs, manages handling a
