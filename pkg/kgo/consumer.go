@@ -694,6 +694,14 @@ func (cl *Client) SetOffsets(setOffsets map[string]map[int32]EpochOffset) {
 // usingCursors, or a list or epoch load for the partition is pending in the
 // current session. Only an installed, load-free partition stays a no-op. Called
 // under c.mu; the session lock is taken after it, as in assignPartitions.
+//
+// The session lock is held across both the pending-load snapshot and every
+// usingCursors read. The async load writer (handleListOrEpochResults) installs
+// cursors into usingCursors under this same lock while a session lives, and
+// c.mu does not protect that writer, so reading the map under c.mu alone races
+// it. The lock is released when this function returns, before assignPartitions
+// runs; stopSession waits on workers that may need the lock, so it must not be
+// held across assignPartitions.
 func (c *consumer) addUninstalledEqualDirty(assigns, equalDirty map[string]map[int32]Offset, tps *topicsPartitions) map[string]map[int32]Offset {
 	if len(equalDirty) == 0 || tps == nil {
 		return assigns
@@ -702,8 +710,8 @@ func (c *consumer) addUninstalledEqualDirty(assigns, equalDirty map[string]map[i
 	var pending listOrEpochLoads
 	if session != noConsumerSession {
 		session.listOrEpochMu.Lock()
+		defer session.listOrEpochMu.Unlock()
 		pending = pendingLoadSnapshot(session.listOrEpochLoadsWaiting, session.listOrEpochLoadsLoading)
-		session.listOrEpochMu.Unlock()
 	}
 	topics := tps.load()
 	for topic, partitions := range equalDirty {
