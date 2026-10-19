@@ -699,13 +699,21 @@ func (cl *Client) SetOffsets(setOffsets map[string]map[int32]EpochOffset) {
 // usingCursors read. The async load writer (handleListOrEpochResults) installs
 // cursors into usingCursors under this same lock while a session lives, and
 // c.mu does not protect that writer, so reading the map under c.mu alone races
-// it. The lock is released when this function returns, before assignPartitions
-// runs; stopSession waits on workers that may need the lock, so it must not be
-// held across assignPartitions.
+// it.
+//
+// sessionChangeMu is taken before the session is loaded and held through the
+// inspection. Metadata stop/restart replaces the session independently of c.mu,
+// so without this lifetime guard the helper could load a session that is then
+// stopped, or inspect the maps of a session that is being merged. Lock order is
+// c.mu, then sessionChangeMu, then session.listOrEpochMu. All three are released
+// when this function returns, before assignPartitions runs; stopSession waits on
+// workers that may need these locks, so they must not be held across it.
 func (c *consumer) addUninstalledEqualDirty(assigns, equalDirty map[string]map[int32]Offset, tps *topicsPartitions) map[string]map[int32]Offset {
 	if len(equalDirty) == 0 || tps == nil {
 		return assigns
 	}
+	c.sessionChangeMu.Lock()
+	defer c.sessionChangeMu.Unlock()
 	session := c.loadSession()
 	var pending listOrEpochLoads
 	if session != noConsumerSession {
