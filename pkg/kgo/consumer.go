@@ -1050,6 +1050,7 @@ func (c *consumer) assignPartitions(assignments map[string]map[int32]Offset, how
 							usedCursor.unset()
 							shouldKeep = false
 						} else { // how == assignSetMatching
+							c.cl.cfg.hooks.fetchPositionResolved(usedCursor.topic, usedCursor.partition, assignPart.at, assignPart.epoch, nil)
 							usedCursor.setOffset(cursorOffset{
 								offset:            assignPart.at,
 								lastConsumedEpoch: assignPart.epoch,
@@ -1198,6 +1199,7 @@ func (c *consumer) assignPartitions(assignments map[string]map[int32]Offset, how
 			if offset.at >= 0 && partition >= 0 && partition < int32(len(topicPartitions.partitions)) {
 				part := topicPartitions.partitions[partition]
 				cursor := part.cursor
+				c.cl.cfg.hooks.fetchPositionResolved(topic, partition, offset.at, -1, nil)
 				cursor.setOffset(cursorOffset{
 					offset:            offset.at,
 					lastConsumedEpoch: -1,
@@ -1933,6 +1935,9 @@ func (s *consumerSession) handleListOrEpochResults(loaded loadedOffsets) (reload
 				tusing[load.partition] = EpochOffset{load.leaderEpoch, load.offset}
 			}
 
+			// Runs before the cursor is usable, so the partition is not fetched
+			// before the hook returns.
+			s.c.cl.cfg.hooks.fetchPositionResolved(load.topic, load.partition, load.offset, load.leaderEpoch, load.err)
 			load.cursor.setOffset(cursorOffset{
 				offset:            load.offset,
 				lastConsumedEpoch: load.leaderEpoch,

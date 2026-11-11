@@ -1,0 +1,56 @@
+name: cursor-hook
+
+on:
+  pull_request:
+    branches: [crpko-v1.20.7]
+  push:
+    branches: [feat/observe-resolved-fetch-position]
+
+permissions:
+  contents: read
+
+jobs:
+  cursor-hook:
+    # Runs only in the Equicom fork; the upstream repository skips this job.
+    if: github.repository == 'Equicom-Crypto/franz-go'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KGO_TEST_RF: '1'
+      KGO_SEEDS: '127.0.0.1:9092'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Create the local workspace for the nested modules
+        run: go work init . ./pkg/kfake ./pkg/kadm ./pkg/kmsg
+      - name: Vet the client package
+        run: go vet ./pkg/kgo
+      - name: Build the fake broker once
+        run: go build -o /tmp/franz-kfake ./pkg/kfake/main.go
+      - name: Race tests against the fake broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/franz-kfake --as-version 3.9 > /tmp/franz-kfake.log 2>&1 &
+          fake_pid=$!
+          trap 'status=$?; kill "$fake_pid" 2>/dev/null || true; if [ "$status" -ne 0 ]; then tail -n 200 /tmp/franz-kfake.log || true; fi' EXIT
+          ready=0
+          python3 - <<'PY' || ready=1
+          import socket, sys, time
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              try:
+                  socket.create_connection(("127.0.0.1", 9092), timeout=1).close()
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(0.5)
+          sys.exit(1)
+          PY
+          if [ "$ready" -ne 0 ]; then
+            echo "fake broker did not accept connections on 127.0.0.1:9092 within 30s"
+            exit 1
+          fi
+          go test -race -count=1 ./pkg/kgo
+          go test -race -count=1 ./pkg/kfake/...
