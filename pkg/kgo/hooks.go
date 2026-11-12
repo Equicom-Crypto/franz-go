@@ -394,6 +394,45 @@ type HookFetchRecordUnbuffered interface {
 	OnFetchRecordUnbuffered(r *Record, polled bool)
 }
 
+////////////////////
+// FETCH POSITION //
+////////////////////
+
+// HookFetchPositionResolved is called when the client resolves the offset that
+// fetching a partition starts from. It is called for an exact offset assigned
+// without epoch validation, for a SetOffsets reposition of a partition that is
+// already in use, and for a successful ListOffsets or OffsetForLeaderEpoch
+// result.
+//
+// The cause is nil for an exact offset and for a successful result. For a
+// result that reports data loss, cause is the same error value the client
+// queues for the partition as a fetch error, so a consumer can match that
+// fetch error to this call by identity. The offset is then the one the client
+// resumes from.
+//
+// The hook runs immediately before the partition's cursor is made usable, or
+// before the new offset is used for an in-use partition, so the partition is
+// not fetched at the old position after the hook returns. The hook is called
+// while internal consumer locks are held. Implementations must return quickly,
+// must not block, must not perform I/O, and must not call methods on the
+// client, since doing so can deadlock.
+type HookFetchPositionResolved interface {
+	// OnFetchPositionResolved is passed the topic and partition, the offset
+	// that fetching starts from, the leader epoch of that offset (-1 if
+	// unknown), and the cause described above.
+	OnFetchPositionResolved(topic string, partition int32, offset int64, leaderEpoch int32, cause error)
+}
+
+// fetchPositionResolved calls OnFetchPositionResolved on each
+// HookFetchPositionResolved in hs.
+func (hs hooks) fetchPositionResolved(topic string, partition int32, offset int64, leaderEpoch int32, cause error) {
+	for _, h := range hs {
+		if fh, ok := h.(HookFetchPositionResolved); ok {
+			fh.OnFetchPositionResolved(topic, partition, offset, leaderEpoch, cause)
+		}
+	}
+}
+
 /////////////
 // HELPERS //
 /////////////
@@ -416,7 +455,8 @@ func implementsAnyHook(h Hook) bool {
 		HookProduceRecordPartitioned,
 		HookProduceRecordUnbuffered,
 		HookFetchRecordBuffered,
-		HookFetchRecordUnbuffered:
+		HookFetchRecordUnbuffered,
+		HookFetchPositionResolved:
 		return true
 	}
 	return false
