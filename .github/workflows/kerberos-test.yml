@@ -12,10 +12,14 @@ on:
       - 'pkg/sasl/kerberos/**'
       - '.github/workflows/kerberos-test.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   kerberos-test:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "integration test kerberos"
 
     steps:
