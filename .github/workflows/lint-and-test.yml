@@ -23,7 +23,7 @@ concurrency:
 jobs:
   golangci:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "golangci-lint"
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
 
   test-kfake:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "test kfake"
     container: golang:latest
     steps:
@@ -50,7 +50,7 @@ jobs:
 
   test-sr:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "test sr"
     container: golang:latest
     steps:
@@ -59,7 +59,7 @@ jobs:
 
   integration-test-kfake:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "integration test kfake ${{ matrix.version }}${{ matrix.data-dir && ' (persist)' || '' }}"
     container: golang:latest
     strategy:
@@ -98,7 +98,7 @@ jobs:
   # builds one from Kafka's Dockerfile and the staged tarball.
   detect-kafka-rc:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "detect Kafka release candidate"
     outputs:
       matrix: ${{ steps.detect.outputs.matrix }}
@@ -122,7 +122,7 @@ jobs:
   integration-test-kafka:
     if: github.repository == 'twmb/franz-go'
     needs: detect-kafka-rc
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "integration test kafka${{ matrix.name }}"
     strategy:
       fail-fast: false
@@ -224,7 +224,7 @@ jobs:
 
   integration-test-kafka-38:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "integration test kafka 3.8"
     container: golang:latest
     services:
@@ -254,7 +254,7 @@ jobs:
 
   integration-test-redpanda:
     if: github.repository == 'twmb/franz-go'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     name: "integration test redpanda"
     container: golang:latest
     services:
